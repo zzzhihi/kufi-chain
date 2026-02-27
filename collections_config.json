@@ -1,0 +1,47 @@
+[
+  {
+    "name": "collectionIntraBank_Techcombank",
+    "policy": "OR('TechcombankMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 1,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  },
+  {
+    "name": "collectionIntraBank_Vietcombank",
+    "policy": "OR('VietcombankMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 1,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  },
+  {
+    "name": "collectionInterBank",
+    "policy": "OR('TechcombankMSP.member', 'VietcombankMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 2,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  },
+  {
+    "name": "collectionHighRisk",
+    "policy": "OR('TechcombankMSP.member', 'VietcombankMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 2,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  },
+  {
+    "name": "collectionRegulator",
+    "policy": "OR('TechcombankMSP.member', 'VietcombankMSP.member')",
+    "requiredPeerCount": 0,
+    "maxPeerCount": 2,
+    "blockToLive": 0,
+    "memberOnlyRead": true,
+    "memberOnlyWrite": true
+  }
+]
