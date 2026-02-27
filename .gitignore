@@ -3,8 +3,7 @@
 deploy/
 
 # Build artifacts
-kufichain
-gateway
+
 *.tar.gz
 
 # IDE
