@@ -9,14 +9,21 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+
+	commonpb "github.com/hyperledger/fabric-protos-go-apiv2/common"
+	msppb "github.com/hyperledger/fabric-protos-go-apiv2/msp"
+	peerpb "github.com/hyperledger/fabric-protos-go-apiv2/peer"
+	"google.golang.org/protobuf/proto"
 )
 
 // ────────────────────────────────────────────────────────────────────
@@ -258,6 +265,9 @@ func (cc *ChaincodeOps) InstallChaincode(pkgPath string) (string, error) {
 // with the CURRENT signature policy. Uses checkcommitreadiness to ensure
 // the approval matches the desired policy (not just any approval at the sequence).
 func (cc *ChaincodeOps) IsApprovedForMyOrg(sequence int) bool {
+	if result, ok := cc.queryCommittedDefinition(); ok && result.Sequence == sequence && len(result.Approvals) > 0 {
+		return result.Approvals[cc.MSPID]
+	}
 	approvals := cc.CheckCommitReadiness(sequence)
 	if approvals == nil {
 		return false
@@ -303,6 +313,9 @@ func (cc *ChaincodeOps) readinessArgs(sequence int) []string {
 // WaitForLifecycleReady waits until peer lifecycle commands can read channel config
 // with this org identity. This avoids early approve/commit failures right after join.
 func (cc *ChaincodeOps) WaitForLifecycleReady(sequence int, timeoutSec int) error {
+	if result, ok := cc.queryCommittedDefinition(); ok && result.Sequence >= sequence && sequence > 0 {
+		return nil
+	}
 	if timeoutSec <= 0 {
 		timeoutSec = 1
 	}
@@ -380,6 +393,34 @@ func (cc *ChaincodeOps) ApproveChaincode(packageID string, sequence int) error {
 // CommittedSequence returns the latest committed sequence number for this
 // chaincode, or 0 if not yet committed.
 func (cc *ChaincodeOps) CommittedSequence() int {
+	result, ok := cc.queryCommittedDefinition()
+	if !ok {
+		return 0
+	}
+	return result.Sequence
+}
+
+// CommittedSignaturePolicy returns the current committed signature policy in
+// canonical OR('OrgMSP.peer',...) form when it can be decoded.
+func (cc *ChaincodeOps) CommittedSignaturePolicy() string {
+	result, ok := cc.queryCommittedDefinition()
+	if !ok {
+		return ""
+	}
+	policy, err := decodeValidationPolicy(result.ValidationParameter)
+	if err != nil {
+		return ""
+	}
+	return policy
+}
+
+type committedDefinition struct {
+	Sequence            int             `json:"sequence"`
+	ValidationParameter string          `json:"validation_parameter"`
+	Approvals           map[string]bool `json:"approvals"`
+}
+
+func (cc *ChaincodeOps) queryCommittedDefinition() (*committedDefinition, bool) {
 	cmd := exec.Command("peer", "lifecycle", "chaincode", "querycommitted",
 		"-C", cc.ChannelName,
 		"-n", cc.ChaincodeName,
@@ -388,20 +429,21 @@ func (cc *ChaincodeOps) CommittedSequence() int {
 	cmd.Env = cc.peerEnv()
 	out, err := cmd.Output()
 	if err != nil {
-		return 0
+		return nil, false
 	}
 
-	var result struct {
-		Sequence int `json:"sequence"`
-	}
+	var result committedDefinition
 	if err := json.Unmarshal(out, &result); err != nil {
-		return 0
+		return nil, false
 	}
-	return result.Sequence
+	return &result, true
 }
 
 // CheckCommitReadiness returns a map of org MSPID → approved (bool).
 func (cc *ChaincodeOps) CheckCommitReadiness(sequence int) map[string]bool {
+	if result, ok := cc.queryCommittedDefinition(); ok && result.Sequence == sequence && len(result.Approvals) > 0 {
+		return result.Approvals
+	}
 	cmd := exec.Command("peer", cc.readinessArgs(sequence)...)
 	cmd.Dir = cc.DeployDir
 	cmd.Env = cc.peerEnv()
@@ -538,25 +580,20 @@ func (cc *ChaincodeOps) StopCCContainer() error {
 // are skipped automatically.
 func (cc *ChaincodeOps) EnsureChaincodeDeployed() error {
 	committedSeq := cc.CommittedSequence()
+	committedPolicy := cc.CommittedSignaturePolicy()
 
 	// Determine the target sequence.
 	targetSeq := 1
 	upgrading := false
 	if committedSeq >= 1 {
-		if cc.SignaturePolicy == "" {
-			// Already committed, no upgrade configured — just ensure container is running.
-			pkgID := cc.InstalledPackageID()
-			if pkgID != "" {
-				if err := cc.StartCCContainer(pkgID); err != nil {
-					return fmt.Errorf("start chaincode container: %w", err)
-				}
-			}
-			return nil
+		if cc.SignaturePolicy == "" || committedPolicy == cc.SignaturePolicy {
+			targetSeq = committedSeq
+		} else {
+			// OR-policy upgrade: target the next sequence.
+			targetSeq = committedSeq + 1
+			upgrading = true
+			fmt.Printf("  Chaincode at seq %d — upgrading to seq %d with OR policy...\n", committedSeq, targetSeq)
 		}
-		// OR-policy upgrade: target the next sequence.
-		targetSeq = committedSeq + 1
-		upgrading = true
-		fmt.Printf("  Chaincode at seq %d — upgrading to seq %d with OR policy...\n", committedSeq, targetSeq)
 	}
 
 	// ── Build Docker image (idempotent — uses Docker layer cache) ─────
@@ -613,6 +650,8 @@ func (cc *ChaincodeOps) EnsureChaincodeDeployed() error {
 	if !cc.IsApprovedForMyOrg(targetSeq) {
 		if upgrading {
 			fmt.Printf("  Chaincode: approving seq %d (OR policy) for %s...\n", targetSeq, cc.MSPID)
+		} else if committedSeq >= 1 {
+			fmt.Printf("  Chaincode: approving committed seq %d for %s...\n", targetSeq, cc.MSPID)
 		} else {
 			fmt.Printf("  Chaincode: approving for %s...\n", cc.MSPID)
 		}
@@ -620,6 +659,11 @@ func (cc *ChaincodeOps) EnsureChaincodeDeployed() error {
 			return fmt.Errorf("approve chaincode: %w", err)
 		}
 		fmt.Println("  ✓ Approved")
+	}
+
+	if committedSeq >= 1 && !upgrading {
+		fmt.Printf("  ✓ Current chaincode definition is active at seq %d\n", targetSeq)
+		return nil
 	}
 
 	// ── Check readiness & commit if majority reached ───────────────────
@@ -675,18 +719,30 @@ func (cc *ChaincodeOps) EnsureChaincodeDeployed() error {
 // Returns true once the target sequence is committed.
 func (cc *ChaincodeOps) TryCommitIfReady() bool {
 	committedSeq := cc.CommittedSequence()
+	committedPolicy := cc.CommittedSignaturePolicy()
 
 	// Determine the target sequence.
 	targetSeq := 1
 	if committedSeq >= 1 {
-		if cc.SignaturePolicy == "" {
-			return true // already committed, no upgrade needed
+		if cc.SignaturePolicy == "" || committedPolicy == cc.SignaturePolicy {
+			targetSeq = committedSeq
+		} else {
+			targetSeq = committedSeq + 1
 		}
-		targetSeq = committedSeq + 1
 	}
 
 	// Already committed at or beyond target?
-	if committedSeq >= targetSeq {
+	if committedSeq >= targetSeq && targetSeq == committedSeq {
+		if !cc.IsApprovedForMyOrg(targetSeq) {
+			pkgID := cc.InstalledPackageID()
+			if pkgID == "" {
+				return false
+			}
+			if err := cc.ApproveChaincode(pkgID, targetSeq); err != nil {
+				return false
+			}
+			fmt.Printf("  ✓ Auto-approved committed chaincode at seq %d\n", targetSeq)
+		}
 		return true
 	}
 
@@ -744,6 +800,91 @@ func (cc *ChaincodeOps) notifyPeersToUpgrade() {
 // ────────────────────────────────────────────────────────────────────
 // helpers
 // ────────────────────────────────────────────────────────────────────
+
+func decodeValidationPolicy(encoded string) (string, error) {
+	if strings.TrimSpace(encoded) == "" {
+		return "", nil
+	}
+
+	raw, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return "", err
+	}
+
+	appPolicy := &peerpb.ApplicationPolicy{}
+	if err := proto.Unmarshal(raw, appPolicy); err == nil {
+		if sig := appPolicy.GetSignaturePolicy(); sig != nil {
+			return signatureEnvelopeToPolicy(sig)
+		}
+		if ref := appPolicy.GetChannelConfigPolicyReference(); ref != "" {
+			return "channelconfig:" + ref, nil
+		}
+	}
+
+	sigPolicy := &commonpb.SignaturePolicyEnvelope{}
+	if err := proto.Unmarshal(raw, sigPolicy); err != nil {
+		return "", err
+	}
+	return signatureEnvelopeToPolicy(sigPolicy)
+}
+
+func signatureEnvelopeToPolicy(env *commonpb.SignaturePolicyEnvelope) (string, error) {
+	if env == nil {
+		return "", fmt.Errorf("missing signature policy envelope")
+	}
+
+	mspIDs := make([]string, 0, len(env.Identities))
+	for _, principal := range env.Identities {
+		if principal.GetPrincipalClassification() != msppb.MSPPrincipal_ROLE {
+			return "", fmt.Errorf("unsupported principal classification")
+		}
+		role := &msppb.MSPRole{}
+		if err := proto.Unmarshal(principal.Principal, role); err != nil {
+			return "", err
+		}
+		if role.GetRole() != msppb.MSPRole_PEER {
+			return "", fmt.Errorf("unsupported MSP role %s", role.GetRole().String())
+		}
+		mspIDs = append(mspIDs, role.GetMspIdentifier())
+	}
+	if !isORPolicyRule(env.Rule, len(mspIDs)) {
+		return "", fmt.Errorf("unsupported signature policy shape")
+	}
+	sort.Strings(mspIDs)
+	parts := make([]string, len(mspIDs))
+	for i, id := range mspIDs {
+		parts[i] = fmt.Sprintf("'%s.peer'", id)
+	}
+	return fmt.Sprintf("OR(%s)", strings.Join(parts, ",")), nil
+}
+
+func isORPolicyRule(rule *commonpb.SignaturePolicy, identities int) bool {
+	if rule == nil {
+		return false
+	}
+	nOutOf, ok := rule.GetType().(*commonpb.SignaturePolicy_NOutOf_)
+	if !ok || nOutOf.NOutOf == nil {
+		return false
+	}
+	if nOutOf.NOutOf.N != 1 || len(nOutOf.NOutOf.Rules) != identities {
+		return false
+	}
+	seen := make(map[int32]struct{}, identities)
+	for _, sub := range nOutOf.NOutOf.Rules {
+		signedBy, ok := sub.GetType().(*commonpb.SignaturePolicy_SignedBy)
+		if !ok {
+			return false
+		}
+		if signedBy.SignedBy < 0 || int(signedBy.SignedBy) >= identities {
+			return false
+		}
+		if _, dup := seen[signedBy.SignedBy]; dup {
+			return false
+		}
+		seen[signedBy.SignedBy] = struct{}{}
+	}
+	return len(seen) == identities
+}
 
 func truncate(s string, n int) string {
 	if len(s) <= n {

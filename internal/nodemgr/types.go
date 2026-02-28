@@ -68,6 +68,7 @@ type JoinRequest struct {
 	OrgName       string        `json:"org_name"`
 	MSPID         string        `json:"msp_id"`
 	Domain        string        `json:"domain"`
+	PeerHost      string        `json:"peer_host,omitempty"` // host/IP peers should use to reach this node's peer
 	AnchorHost    string        `json:"anchor_host"`
 	AnchorPort    int           `json:"anchor_port"`
 	PeerPort      int           `json:"peer_port"`
@@ -91,15 +92,24 @@ type Vote struct {
 
 // ApprovalNotification is sent to the joining node when approved.
 type ApprovalNotification struct {
-	RequestID       string     `json:"request_id"`
-	Approved        bool       `json:"approved"`
-	OrdererAddr     string     `json:"orderer_addr"`
-	OrdererHostIP   string     `json:"orderer_host_ip,omitempty"` // resolved IP for orderer.<networkDomain> mapping
-	OrdererTLSCA    string     `json:"orderer_tls_ca"`            // base64-encoded PEM
-	OrdererMgmtAddr string     `json:"orderer_mgmt_addr"`         // orderer mgmt API (http://host:port)
-	ChannelName     string     `json:"channel_name"`
-	NetworkDomain   string     `json:"network_domain"`
-	ExistingPeers   []PeerInfo `json:"existing_peers,omitempty"` // seed peer list for joining node
+	RequestID       string      `json:"request_id"`
+	Approved        bool        `json:"approved"`
+	OrdererAddr     string      `json:"orderer_addr"`
+	OrdererHostIP   string      `json:"orderer_host_ip,omitempty"` // resolved IP for orderer.<networkDomain> mapping
+	OrdererTLSCA    string      `json:"orderer_tls_ca"`            // base64-encoded PEM
+	OrdererMgmtAddr string      `json:"orderer_mgmt_addr"`         // orderer mgmt API (http://host:port)
+	ChannelName     string      `json:"channel_name"`
+	NetworkDomain   string      `json:"network_domain"`
+	ExistingPeers   []PeerInfo  `json:"existing_peers,omitempty"`   // seed peer list for joining node
+	ExistingBundles []OrgBundle `json:"existing_bundles,omitempty"` // org crypto bundles so the joining node can talk TLS to existing peers
+}
+
+// OrgBundle carries a peer org's crypto material to another node.
+type OrgBundle struct {
+	OrgName string `json:"org_name"`
+	MSPID   string `json:"msp_id"`
+	Domain  string `json:"domain"`
+	Bundle  string `json:"bundle"`
 }
 
 // Heartbeat is sent periodically by each node to its gossip targets.

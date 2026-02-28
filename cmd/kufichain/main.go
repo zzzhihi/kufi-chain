@@ -711,6 +711,7 @@ func setupPeerWithBootstrap(reader *bufio.Reader, dataDir string, store *nodemgr
 		OrgName:       orgName,
 		MSPID:         mspID,
 		Domain:        domain,
+		PeerHost:      externalHost,
 		AnchorHost:    fmt.Sprintf("peer0.%s", domain),
 		AnchorPort:    peerPort,
 		PeerPort:      peerPort,
@@ -794,6 +795,15 @@ func setupPeerWithBootstrap(reader *bufio.Reader, dataDir string, store *nodemgr
 	for _, p := range notif.ExistingPeers {
 		if err := store.AddPeer(p); err != nil {
 			fmt.Fprintf(os.Stderr, "  Warning: add peer %s: %v\n", p.MSPID, err)
+		}
+	}
+	for _, bundle := range notif.ExistingBundles {
+		if bundle.Bundle == "" {
+			continue
+		}
+		targetDir := filepath.Join(deployDir, "crypto-config", "peerOrganizations")
+		if err := fabricops.UnpackMSPBundle(bundle.Bundle, targetDir); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: unpack org bundle %s: %v\n", bundle.MSPID, err)
 		}
 	}
 
@@ -1083,8 +1093,8 @@ func startDashboard(store *nodemgr.Store, nodeCfg *nodemgr.NodeConfig) {
 			ChaincodeVer:    "1.0",
 			CCLabel:         "payment_1.0",
 			ProjectRoot:     findProjectRoot(),
-			PeerEndpoints:   discoverPeerEndpoints(nodeCfg.DataDir),
-			SignaturePolicy: buildSignaturePolicy(nodeCfg.DataDir, nodeCfg.MSPID),
+			PeerEndpoints:   buildPeerEndpoints(store, nodeCfg),
+			SignaturePolicy: buildSignaturePolicy(store, nodeCfg),
 		}
 
 		fmt.Println("  Chaincode: ensuring deployment...")
@@ -1100,9 +1110,8 @@ func startDashboard(store *nodemgr.Store, nodeCfg *nodemgr.NodeConfig) {
 			ticker := time.NewTicker(15 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				// Re-scan peer data dirs — a newly joined peer may have appeared.
-				ccOps.PeerEndpoints = discoverPeerEndpoints(nodeCfg.DataDir)
-				newPolicy := buildSignaturePolicy(nodeCfg.DataDir, nodeCfg.MSPID)
+				ccOps.PeerEndpoints = buildPeerEndpoints(store, nodeCfg)
+				newPolicy := buildSignaturePolicy(store, nodeCfg)
 				if newPolicy != "" {
 					ccOps.SignaturePolicy = newPolicy
 				}
@@ -1283,8 +1292,8 @@ func startDashboard(store *nodemgr.Store, nodeCfg *nodemgr.NodeConfig) {
 			drainRefreshCh(mgr.RefreshCh)
 			// Re-evaluate chaincode policy when something changes (e.g. new peer joined)
 			if isPeer && ccOps != nil {
-				ccOps.PeerEndpoints = discoverPeerEndpoints(nodeCfg.DataDir)
-				newPolicy := buildSignaturePolicy(nodeCfg.DataDir, nodeCfg.MSPID)
+				ccOps.PeerEndpoints = buildPeerEndpoints(store, nodeCfg)
+				newPolicy := buildSignaturePolicy(store, nodeCfg)
 				if newPolicy != "" && newPolicy != ccOps.SignaturePolicy {
 					ccOps.SignaturePolicy = newPolicy
 					go func() {
@@ -1682,96 +1691,88 @@ func drainRefreshCh(ch chan struct{}) {
 // Helpers
 // =====================================================================
 
-// discoverPeerEndpoints scans sibling data directories for other peer nodes
-// and returns their endpoints for chaincode commit endorsement.
-func discoverPeerEndpoints(myDataDir string) []fabricops.PeerEndpoint {
-	parentDir := filepath.Dir(myDataDir)
-	entries, err := os.ReadDir(parentDir)
-	if err != nil {
-		return nil
-	}
-
-	var endpoints []fabricops.PeerEndpoint
-	for _, e := range entries {
-		if !e.IsDir() {
+// buildPeerEndpoints returns the current peer topology for lifecycle commit.
+// The topology comes from the replicated peer registry instead of local
+// sibling directories, so it works across multiple machines.
+func buildPeerEndpoints(store *nodemgr.Store, cfg *nodemgr.NodeConfig) []fabricops.PeerEndpoint {
+	peers := collectKnownPeers(store, cfg)
+	endpoints := make([]fabricops.PeerEndpoint, 0, len(peers))
+	for _, peer := range peers {
+		if peer.Domain == "" || peer.PeerAddr == "" {
 			continue
 		}
-		dir := filepath.Join(parentDir, e.Name())
-		nodeFile := filepath.Join(dir, "node.json")
-		data, err := os.ReadFile(nodeFile)
-		if err != nil {
-			continue
-		}
-		var cfg struct {
-			Role     string `json:"role"`
-			Domain   string `json:"domain"`
-			PeerPort int    `json:"peer_port"`
-			MgmtPort int    `json:"mgmt_port"`
-		}
-		if json.Unmarshal(data, &cfg) != nil || cfg.Role != "peer" {
-			continue
-		}
-		// Build TLS cert path
-		tlsCert := filepath.Join(dir, "deploy", "crypto-config",
-			"peerOrganizations", cfg.Domain, "peers",
-			fmt.Sprintf("peer0.%s", cfg.Domain), "tls", "ca.crt")
+		tlsCert := filepath.Join(cfg.DeployDir, "crypto-config", "peerOrganizations", peer.Domain,
+			"peers", fmt.Sprintf("peer0.%s", peer.Domain), "tls", "ca.crt")
 		if _, err := os.Stat(tlsCert); err != nil {
 			continue
 		}
-		ep := fabricops.PeerEndpoint{
-			Addr:        fmt.Sprintf("localhost:%d", cfg.PeerPort),
+		endpoints = append(endpoints, fabricops.PeerEndpoint{
+			Addr:        peer.PeerAddr,
 			TLSCertPath: tlsCert,
-		}
-		if cfg.MgmtPort > 0 {
-			ep.MgmtAddr = fmt.Sprintf("http://localhost:%d", cfg.MgmtPort)
-		}
-		endpoints = append(endpoints, ep)
+			MgmtAddr:    peer.MgmtAddr,
+		})
 	}
 	return endpoints
 }
 
 // buildSignaturePolicy constructs an OR endorsement policy covering all known
-// peer organizations (including own org). Used when committing chaincode so any
-// single peer org can endorse. Example result:
-//
-//	"OR('TechcombankMSP.peer','VietcombankMSP.peer')"
-func buildSignaturePolicy(myDataDir, myMSPID string) string {
-	parentDir := filepath.Dir(myDataDir)
-	entries, _ := os.ReadDir(parentDir)
-
-	seen := map[string]struct{}{myMSPID: {}}
-	mspIDs := []string{myMSPID}
-
-	for _, e := range entries {
-		if !e.IsDir() {
+// peer organizations so any bank/org node can endorse after it joins.
+func buildSignaturePolicy(store *nodemgr.Store, cfg *nodemgr.NodeConfig) string {
+	peers := collectKnownPeers(store, cfg)
+	mspIDs := make([]string, 0, len(peers))
+	seen := make(map[string]struct{}, len(peers))
+	for _, peer := range peers {
+		if peer.MSPID == "" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(parentDir, e.Name(), "node.json"))
-		if err != nil {
+		if _, ok := seen[peer.MSPID]; ok {
 			continue
 		}
-		var cfg struct {
-			Role  string `json:"role"`
-			MSPID string `json:"msp_id"`
-		}
-		if json.Unmarshal(data, &cfg) != nil || cfg.Role != "peer" || cfg.MSPID == "" {
-			continue
-		}
-		if _, dup := seen[cfg.MSPID]; !dup {
-			seen[cfg.MSPID] = struct{}{}
-			mspIDs = append(mspIDs, cfg.MSPID)
-		}
+		seen[peer.MSPID] = struct{}{}
+		mspIDs = append(mspIDs, peer.MSPID)
 	}
-	// Always use explicit OR policy (even for 1 org) so the channel
-	// default MAJORITY Endorsement isn't applied. With MAJORITY and 2
-	// orgs, BOTH must endorse — breaking intra-bank transfers.
-	// Sort alphabetically so all peers produce the SAME policy string.
 	sort.Strings(mspIDs)
 	parts := make([]string, len(mspIDs))
 	for i, id := range mspIDs {
 		parts[i] = fmt.Sprintf("'%s.peer'", id)
 	}
 	return fmt.Sprintf("OR(%s)", strings.Join(parts, ","))
+}
+
+func collectKnownPeers(store *nodemgr.Store, cfg *nodemgr.NodeConfig) []nodemgr.PeerInfo {
+	peersByMSP := make(map[string]nodemgr.PeerInfo)
+	if store != nil {
+		if peers, err := store.LoadPeers(); err == nil {
+			for _, peer := range peers {
+				if peer.MSPID == "" {
+					continue
+				}
+				peersByMSP[peer.MSPID] = peer
+			}
+		}
+	}
+	if cfg != nil && cfg.Role == nodemgr.RolePeer && cfg.MSPID != "" {
+		host := strings.TrimSpace(cfg.ExternalHost)
+		if host == "" {
+			host = fmt.Sprintf("peer0.%s", cfg.Domain)
+		}
+		peersByMSP[cfg.MSPID] = nodemgr.PeerInfo{
+			OrgName:  cfg.OrgName,
+			MSPID:    cfg.MSPID,
+			Domain:   cfg.Domain,
+			PeerAddr: net.JoinHostPort(host, strconv.Itoa(cfg.PeerPort)),
+			MgmtAddr: fmt.Sprintf("http://%s:%d", host, cfg.MgmtPort),
+		}
+	}
+
+	peers := make([]nodemgr.PeerInfo, 0, len(peersByMSP))
+	for _, peer := range peersByMSP {
+		peers = append(peers, peer)
+	}
+	sort.Slice(peers, func(i, j int) bool {
+		return peers[i].MSPID < peers[j].MSPID
+	})
+	return peers
 }
 
 // resolveOrdererAliasIP resolves the IP used to map orderer.<networkDomain>

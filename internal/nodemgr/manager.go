@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/fabric-payment-gateway/internal/fabricops"
@@ -306,14 +308,8 @@ func (m *Manager) executeApproval(req *JoinRequest) {
 	slog.Info("channel config updated — new org added!", "org", req.OrgName)
 
 	// Register the new peer
-	newPeer := PeerInfo{
-		OrgName:  req.OrgName,
-		MSPID:    req.MSPID,
-		Domain:   req.Domain,
-		PeerAddr: fmt.Sprintf("%s:%d", req.AnchorHost, req.AnchorPort),
-		MgmtAddr: req.MgmtAddr,
-		JoinedAt: time.Now(),
-	}
+	newPeer := peerInfoFromJoinRequest(req)
+	newPeer.JoinedAt = time.Now()
 	m.Store.AddPeer(newPeer)
 
 	// Gossip the new peer info to all
@@ -345,6 +341,7 @@ func (m *Manager) executeApproval(req *JoinRequest) {
 
 	// Include all existing peers so the joining node can seed its peer list
 	allPeers, _ := m.Store.LoadPeers()
+	allBundles := m.buildExistingOrgBundles(allPeers)
 
 	notif := &ApprovalNotification{
 		RequestID:       req.ID,
@@ -356,6 +353,7 @@ func (m *Manager) executeApproval(req *JoinRequest) {
 		ChannelName:     m.Config.ChannelName,
 		NetworkDomain:   m.Config.NetworkDomain,
 		ExistingPeers:   allPeers,
+		ExistingBundles: allBundles,
 	}
 
 	if err := m.Gossip.NotifyApproval(req.MgmtAddr, notif); err != nil {
@@ -405,4 +403,55 @@ func resolveHostToIP(host string) string {
 		}
 	}
 	return ""
+}
+
+func peerInfoFromJoinRequest(req *JoinRequest) PeerInfo {
+	host := strings.TrimSpace(req.PeerHost)
+	if host == "" && req.MgmtAddr != "" {
+		if parsed, err := url.Parse(req.MgmtAddr); err == nil {
+			host = parsed.Hostname()
+		}
+	}
+	if host == "" {
+		host = req.AnchorHost
+	}
+
+	port := req.PeerPort
+	if port == 0 {
+		port = req.AnchorPort
+	}
+
+	return PeerInfo{
+		OrgName:  req.OrgName,
+		MSPID:    req.MSPID,
+		Domain:   req.Domain,
+		PeerAddr: net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		MgmtAddr: req.MgmtAddr,
+	}
+}
+
+func (m *Manager) buildExistingOrgBundles(peers []PeerInfo) []OrgBundle {
+	bundles := make([]OrgBundle, 0, len(peers))
+	for _, peer := range peers {
+		if peer.Domain == "" {
+			continue
+		}
+		orgDir := filepath.Join(m.Config.DeployDir, "crypto-config", "peerOrganizations", peer.Domain)
+		if _, err := os.Stat(orgDir); err != nil {
+			slog.Warn("skip org bundle for peer", "org", peer.OrgName, "domain", peer.Domain, "err", err)
+			continue
+		}
+		bundle, err := fabricops.PackageMSPDir(orgDir)
+		if err != nil {
+			slog.Warn("package org bundle", "org", peer.OrgName, "domain", peer.Domain, "err", err)
+			continue
+		}
+		bundles = append(bundles, OrgBundle{
+			OrgName: peer.OrgName,
+			MSPID:   peer.MSPID,
+			Domain:  peer.Domain,
+			Bundle:  bundle,
+		})
+	}
+	return bundles
 }
