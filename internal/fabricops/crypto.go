@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +18,9 @@ import (
 )
 
 // GenerateBootstrapCrypto creates crypto material for orderer + first org.
-func GenerateBootstrapCrypto(deployDir, orgName, domain, networkDomain string) error {
+func GenerateBootstrapCrypto(deployDir, orgName, domain, networkDomain, externalHost string) error {
+	ordererSANs := yamlSANEntries("localhost", "127.0.0.1", "orderer."+networkDomain)
+	peerSANs := yamlSANEntries("localhost", "127.0.0.1", "peer0."+domain, externalHost)
 	cryptoCfg := fmt.Sprintf(`OrdererOrgs:
   - Name: Orderer
     Domain: %s
@@ -25,9 +28,7 @@ func GenerateBootstrapCrypto(deployDir, orgName, domain, networkDomain string) e
     Specs:
       - Hostname: orderer
         SANS:
-          - localhost
-          - 127.0.0.1
-          - orderer.%s
+%s
 
 PeerOrgs:
   - Name: %s
@@ -36,12 +37,10 @@ PeerOrgs:
     Template:
       Count: 1
       SANS:
-        - localhost
-        - 127.0.0.1
-        - peer0.%s
+%s
     Users:
       Count: 1
-`, networkDomain, networkDomain, orgName, domain, domain)
+`, networkDomain, ordererSANs, orgName, domain, peerSANs)
 
 	cfgPath := filepath.Join(deployDir, "crypto-config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cryptoCfg), 0o644); err != nil {
@@ -58,7 +57,8 @@ PeerOrgs:
 
 // GenerateOrdererOnlyCrypto creates crypto material for a dedicated orderer node.
 // Only generates OrdererOrg — no peer orgs.
-func GenerateOrdererOnlyCrypto(deployDir, networkDomain string) error {
+func GenerateOrdererOnlyCrypto(deployDir, networkDomain, externalHost string) error {
+	ordererSANs := yamlSANEntries("localhost", "127.0.0.1", "orderer."+networkDomain, externalHost)
 	cryptoCfg := fmt.Sprintf(`OrdererOrgs:
   - Name: Orderer
     Domain: %s
@@ -66,10 +66,8 @@ func GenerateOrdererOnlyCrypto(deployDir, networkDomain string) error {
     Specs:
       - Hostname: orderer
         SANS:
-          - localhost
-          - 127.0.0.1
-          - orderer.%s
-`, networkDomain, networkDomain)
+%s
+`, networkDomain, ordererSANs)
 
 	cfgPath := filepath.Join(deployDir, "crypto-config.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cryptoCfg), 0o644); err != nil {
@@ -85,7 +83,8 @@ func GenerateOrdererOnlyCrypto(deployDir, networkDomain string) error {
 }
 
 // GenerateOrgCrypto creates crypto material for a single joining org.
-func GenerateOrgCrypto(deployDir, orgName, domain string) error {
+func GenerateOrgCrypto(deployDir, orgName, domain, externalHost string) error {
+	peerSANs := yamlSANEntries("localhost", "127.0.0.1", "peer0."+domain, externalHost)
 	cryptoCfg := fmt.Sprintf(`PeerOrgs:
   - Name: %s
     Domain: %s
@@ -93,12 +92,10 @@ func GenerateOrgCrypto(deployDir, orgName, domain string) error {
     Template:
       Count: 1
       SANS:
-        - localhost
-        - 127.0.0.1
-        - peer0.%s
+%s
     Users:
       Count: 1
-`, orgName, domain, domain)
+`, orgName, domain, peerSANs)
 
 	cfgPath := filepath.Join(deployDir, "crypto-config-join.yaml")
 	if err := os.WriteFile(cfgPath, []byte(cryptoCfg), 0o644); err != nil {
@@ -108,6 +105,39 @@ func GenerateOrgCrypto(deployDir, orgName, domain string) error {
 	return runCmd(deployDir, "cryptogen", "generate",
 		"--config=crypto-config-join.yaml",
 		"--output=crypto-config")
+}
+
+func yamlSANEntries(values ...string) string {
+	seen := make(map[string]struct{}, len(values))
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
+		v := strings.TrimSpace(value)
+		if v == "" {
+			continue
+		}
+		if strings.HasPrefix(v, "http://") || strings.HasPrefix(v, "https://") {
+			if parsed, err := neturlParse(v); err == nil {
+				v = parsed
+			}
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		lines = append(lines, "        - "+v)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func neturlParse(raw string) (string, error) {
+	host := raw
+	if idx := strings.Index(raw, "://"); idx >= 0 {
+		host = raw[idx+3:]
+	}
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		return h, nil
+	}
+	return host, nil
 }
 
 // GenerateOrgDefinitionJSON runs configtxgen -printOrg to produce the JSON

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -72,5 +73,39 @@ func TestBuildSignaturePolicyUsesRegistryPeers(t *testing.T) {
 	want := "OR('PeerOneMSP.peer','PeerThreeMSP.peer','PeerTwoMSP.peer')"
 	if policy != want {
 		t.Fatalf("unexpected policy: %s", policy)
+	}
+}
+
+func TestBuildPeerEndpointsUsesLocalhostForSelf(t *testing.T) {
+	baseDir := t.TempDir()
+	store := nodemgr.NewStore(baseDir)
+	if err := store.Init(); err != nil {
+		t.Fatalf("init store: %v", err)
+	}
+	cfg := &nodemgr.NodeConfig{
+		Role:         nodemgr.RolePeer,
+		OrgName:      "PeerOne",
+		MSPID:        "PeerOneMSP",
+		Domain:       "peerone.kufichain.network",
+		ExternalHost: "18.141.70.237",
+		PeerPort:     7051,
+		MgmtPort:     9500,
+		DeployDir:    filepath.Join(baseDir, "deploy"),
+	}
+
+	tlsDir := filepath.Join(cfg.DeployDir, "crypto-config", "peerOrganizations", cfg.Domain, "peers", "peer0."+cfg.Domain, "tls")
+	if err := os.MkdirAll(tlsDir, 0o755); err != nil {
+		t.Fatalf("mkdir tls dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(tlsDir, "ca.crt"), []byte("dummy"), 0o644); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+
+	endpoints := buildPeerEndpoints(store, cfg)
+	if len(endpoints) != 1 {
+		t.Fatalf("expected 1 endpoint, got %d", len(endpoints))
+	}
+	if endpoints[0].Addr != "localhost:7051" {
+		t.Fatalf("expected localhost self endpoint, got %s", endpoints[0].Addr)
 	}
 }

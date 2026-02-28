@@ -285,7 +285,7 @@ func setupOrderer(reader *bufio.Reader, dataDir string, store *nodemgr.Store) {
 
 	// Step 1: Generate orderer crypto (OrdererOrg only)
 	step("1/5", "Generating crypto material (orderer keys, TLS certs)...")
-	if err := fabricops.GenerateOrdererOnlyCrypto(deployDir, networkDomain); err != nil {
+	if err := fabricops.GenerateOrdererOnlyCrypto(deployDir, networkDomain, externalHost); err != nil {
 		fatal("Crypto generation: %v", err)
 	}
 	fmt.Println("  ✓ Orderer crypto auto-generated")
@@ -671,7 +671,7 @@ func setupPeerWithBootstrap(reader *bufio.Reader, dataDir string, store *nodemgr
 
 	// Step 1: Generate crypto
 	step("1/3", "Generating crypto material for "+orgName+"...")
-	if err := fabricops.GenerateOrgCrypto(deployDir, orgName, domain); err != nil {
+	if err := fabricops.GenerateOrgCrypto(deployDir, orgName, domain, externalHost); err != nil {
 		fatal("Crypto generation: %v", err)
 	}
 	if err := fabricops.EnsureFabricConfig(deployDir); err != nil {
@@ -1706,8 +1706,14 @@ func buildPeerEndpoints(store *nodemgr.Store, cfg *nodemgr.NodeConfig) []fabrico
 		if _, err := os.Stat(tlsCert); err != nil {
 			continue
 		}
+		addr := peer.PeerAddr
+		if cfg != nil && peer.MSPID == cfg.MSPID {
+			// The local peer CLI should always talk to its own peer over localhost.
+			// Public-IP self-dial can hang on EC2 due to hairpin/NAT behavior.
+			addr = net.JoinHostPort("localhost", strconv.Itoa(cfg.PeerPort))
+		}
 		endpoints = append(endpoints, fabricops.PeerEndpoint{
-			Addr:        peer.PeerAddr,
+			Addr:        addr,
 			TLSCertPath: tlsCert,
 			MgmtAddr:    peer.MgmtAddr,
 		})
