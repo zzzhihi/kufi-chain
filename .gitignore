@@ -15,3 +15,8 @@ deploy/
 # OS
 .DS_Store
 Thumbs.db
+
+kufichain
+.orderer*
+.peer*
+gateway

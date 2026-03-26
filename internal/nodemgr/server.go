@@ -254,16 +254,17 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	pending, _ := s.manager.Store.ListJoinRequests(StatusPending)
 
 	status := map[string]interface{}{
-		"role":             cfg.Role,
-		"org_name":         cfg.OrgName,
-		"msp_id":           cfg.MSPID,
-		"channel":          cfg.ChannelName,
-		"network_domain":   cfg.NetworkDomain,
-		"peer_port":        cfg.PeerPort,
-		"mgmt_port":        cfg.MgmtPort,
-		"orderer":          cfg.OrdererAddr,
-		"known_peers":      len(peers),
-		"pending_requests": len(pending),
+		"role":              cfg.Role,
+		"org_name":          cfg.OrgName,
+		"msp_id":            cfg.MSPID,
+		"channel":           cfg.ChannelName,
+		"network_domain":    cfg.NetworkDomain,
+		"peer_port":         cfg.PeerPort,
+		"mgmt_port":         cfg.MgmtPort,
+		"orderer":           cfg.OrdererAddr,
+		"orderer_mgmt_addr": cfg.OrdererMgmtAddr,
+		"known_peers":       len(peers),
+		"pending_requests":  len(pending),
 	}
 	jsonOK(w, status)
 }

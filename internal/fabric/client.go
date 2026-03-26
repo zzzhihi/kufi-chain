@@ -537,6 +537,12 @@ func (c *Client) extractEndorsements(txn *client.Transaction) []*Endorsement {
 		}
 	}
 
+	if len(endorsements) == 0 {
+		c.logger.Warn("No endorsements extracted from SDK transaction envelope",
+			zap.String("txID", txn.TransactionID()),
+		)
+	}
+
 	return endorsements
 }
 

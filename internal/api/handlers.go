@@ -249,6 +249,14 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 		blockHash = blockInfo.BlockHash
 	}
 
+	txInfo, err := h.blockQuery.GetTransactionByID(ctx, result.TxID)
+	if err != nil {
+		h.logger.Warn("Failed to query committed transaction details for receipt",
+			zap.String("txID", result.TxID),
+			zap.Error(err),
+		)
+	}
+
 	// Build receipt
 	buildInput := &receipt.BuildInput{
 		TxID:             result.TxID,
@@ -264,16 +272,18 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 		CommitTime:       result.CommitTimestamp,
 	}
 
-	// Add endorsements with actual verification status
-	for _, e := range result.Endorsements {
-		buildInput.Endorsements = append(buildInput.Endorsements, receipt.EndorsementInput{
-			MSPID:          e.MSPID,
-			CertPEM:        e.Certificate,
-			Signature:      e.Signature,
-			Timestamp:      e.Timestamp,
-			SignatureValid: e.SignatureValid,
-			CertChainValid: e.CertChainValid,
-		})
+	if txInfo != nil {
+		buildInput.TxIndex = txInfo.TxIndex
+		h.appendCommittedEndorsements(buildInput, txInfo.Endorsements)
+	}
+	if len(buildInput.Endorsements) == 0 {
+		h.appendSubmittedEndorsements(buildInput, result.Endorsements)
+	}
+	if len(buildInput.Endorsements) == 0 {
+		h.logger.Warn("Receipt built without endorsements",
+			zap.String("txID", result.TxID),
+			zap.Int("submittedEndorsements", len(result.Endorsements)),
+		)
 	}
 
 	txReceipt, err := h.receiptBuilder.Build(buildInput)
@@ -321,6 +331,19 @@ func (h *Handler) GetReceipt(c *gin.Context) {
 	if rcpt == nil {
 		h.respondError(c, http.StatusNotFound, ErrCodeNotFound, "Receipt not found", "")
 		return
+	}
+
+	if len(rcpt.Endorsements) == 0 {
+		rebuilt, err := h.rebuildReceiptFromLedger(c.Request.Context(), rcpt)
+		if err != nil {
+			h.logger.Warn("Failed to rebuild receipt endorsements from ledger",
+				zap.String("txID", txID),
+				zap.Error(err),
+			)
+		} else if rebuilt != nil {
+			rcpt = rebuilt
+			h.receiptStore.Store(txID, rcpt)
+		}
 	}
 
 	c.JSON(http.StatusOK, h.receiptToDTO(rcpt))
@@ -459,6 +482,87 @@ func (h *Handler) receiptToDTO(r *receipt.Receipt) *ReceiptDTO {
 	}
 
 	return dto
+}
+
+func (h *Handler) appendCommittedEndorsements(
+	buildInput *receipt.BuildInput,
+	endorsements []*fabric.EndorsementInfo,
+) {
+	for _, e := range endorsements {
+		buildInput.Endorsements = append(buildInput.Endorsements, receipt.EndorsementInput{
+			MSPID:     e.MSPID,
+			CertPEM:   e.Certificate,
+			Signature: e.Signature,
+		})
+	}
+}
+
+func (h *Handler) appendSubmittedEndorsements(
+	buildInput *receipt.BuildInput,
+	endorsements []*fabric.Endorsement,
+) {
+	for _, e := range endorsements {
+		buildInput.Endorsements = append(buildInput.Endorsements, receipt.EndorsementInput{
+			MSPID:          e.MSPID,
+			CertPEM:        e.Certificate,
+			Signature:      e.Signature,
+			Timestamp:      e.Timestamp,
+			SignatureValid: e.SignatureValid,
+			CertChainValid: e.CertChainValid,
+		})
+	}
+}
+
+func (h *Handler) rebuildReceiptFromLedger(
+	ctx context.Context,
+	existing *receipt.Receipt,
+) (*receipt.Receipt, error) {
+	if existing == nil || existing.TxID == "" {
+		return nil, nil
+	}
+
+	txInfo, err := h.blockQuery.GetTransactionByID(ctx, existing.TxID)
+	if err != nil {
+		return nil, err
+	}
+	if len(txInfo.Endorsements) == 0 {
+		return nil, nil
+	}
+
+	buildInput := &receipt.BuildInput{
+		TxID:             existing.TxID,
+		CommitmentHash:   existing.CommitmentHash,
+		BlockNumber:      existing.BlockNumber,
+		BlockHash:        existing.BlockHash,
+		TxIndex:          existing.TxIndex,
+		ValidationCode:   existing.ValidationCode,
+		PolicyID:         existing.PolicyID,
+		PolicyMet:        existing.PolicyMet,
+		InternalRef:      existing.InternalRef,
+		ClientSubmitTime: timeFromUnixMilli(existing.Timestamps.ClientSubmit),
+		EndorsementTime:  timeFromUnixMilli(existing.Timestamps.EndorsementTime),
+		CommitTime:       timeFromUnixMilli(existing.Timestamps.BlockCommit),
+	}
+	if txInfo.TxIndex > 0 {
+		buildInput.TxIndex = txInfo.TxIndex
+	}
+	h.appendCommittedEndorsements(buildInput, txInfo.Endorsements)
+
+	rebuilt, err := h.receiptBuilder.Build(buildInput)
+	if err != nil {
+		return nil, err
+	}
+	rebuilt.ReceiptSignature = existing.ReceiptSignature
+	rebuilt.Timestamps.OrdererReceive = existing.Timestamps.OrdererReceive
+
+	return rebuilt, nil
+}
+
+func timeFromUnixMilli(ms int64) time.Time {
+	if ms == 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
 }
 
 // dtoToReceipt converts API DTO to internal Receipt
