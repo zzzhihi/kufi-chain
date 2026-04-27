@@ -1,0 +1,79 @@
+name: Deploy Chain to AWS EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-aws-chain
+  cancel-in-progress: false
+
+jobs:
+  deploy-orderer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy orderer node
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_ORDERER_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          script_stop: true
+          command_timeout: 60m
+          script: |
+            export CHAIN_DIR=/srv/kufi/dacn_datn/chain
+            export DEPLOY_BRANCH=main
+            bash /srv/kufi/dacn_datn/chain/scripts/deploy-node.sh
+
+  deploy-peer-kufi:
+    runs-on: ubuntu-latest
+    needs: deploy-orderer
+    steps:
+      - name: Deploy peer kufi node
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_PEER_KUFI_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          script_stop: true
+          command_timeout: 60m
+          script: |
+            export CHAIN_DIR=/srv/kufi/dacn_datn/chain
+            export DEPLOY_BRANCH=main
+            bash /srv/kufi/dacn_datn/chain/scripts/deploy-node.sh
+
+  deploy-peer-techcombank:
+    runs-on: ubuntu-latest
+    needs: deploy-orderer
+    steps:
+      - name: Deploy peer techcombank node
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_PEER_TECHCOMBANK_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          script_stop: true
+          command_timeout: 60m
+          script: |
+            export CHAIN_DIR=/srv/kufi/dacn_datn/chain
+            export DEPLOY_BRANCH=main
+            bash /srv/kufi/dacn_datn/chain/scripts/deploy-node.sh
+
+  deploy-peer-tax:
+    runs-on: ubuntu-latest
+    needs: deploy-orderer
+    steps:
+      - name: Deploy peer tax node
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.AWS_PEER_TAX_HOST }}
+          username: ${{ secrets.AWS_EC2_USER }}
+          key: ${{ secrets.AWS_SSH_PRIVATE_KEY }}
+          script_stop: true
+          command_timeout: 60m
+          script: |
+            export CHAIN_DIR=/srv/kufi/dacn_datn/chain
+            export DEPLOY_BRANCH=main
+            bash /srv/kufi/dacn_datn/chain/scripts/deploy-node.sh
