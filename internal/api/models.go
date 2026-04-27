@@ -30,23 +30,45 @@ type TransferResponse struct {
 
 // ReceiptDTO is the API representation of a receipt
 type ReceiptDTO struct {
-	SchemaVersion      string               `json:"schema_version"`
-	ChannelID          string               `json:"channel_id"`
-	TxID               string               `json:"tx_id"`
-	ChaincodeID        string               `json:"chaincode_id"`
-	CommitmentHash     string               `json:"commitment_hash"`
-	BlockNumber        uint64               `json:"block_number"`
-	BlockHash          string               `json:"block_hash,omitempty"`
-	TxIndex            int                  `json:"tx_index,omitempty"`
-	ValidationCode     int32                `json:"validation_code"`
-	ValidationCodeName string               `json:"validation_code_name"`
-	Endorsements       []EndorsementDTO     `json:"endorsements"`
-	PolicyID           string               `json:"policy_id"`
-	PolicyMet          bool                 `json:"policy_met"`
-	Timestamps         TimestampsDTO        `json:"timestamps"`
-	StatusEndpoint     string               `json:"status_endpoint,omitempty"`
-	InternalRef        string               `json:"internal_ref,omitempty"`
-	ReceiptHash        string               `json:"receipt_hash"`
+	SchemaVersion       string                `json:"schema_version"`
+	ChannelID           string                `json:"channel_id"`
+	TxID                string                `json:"tx_id"`
+	ChaincodeID         string                `json:"chaincode_id"`
+	CommitmentHash      string                `json:"commitment_hash"`
+	CommitmentOpening   *CommitmentOpeningDTO `json:"commitment_opening,omitempty"`
+	CommitmentAlgorithm string                `json:"commitment_algorithm,omitempty"`
+	BlockNumber         uint64                `json:"block_number"`
+	BlockHash           string                `json:"block_hash,omitempty"`
+	TxIndex             int                   `json:"tx_index,omitempty"`
+	ValidationCode      int32                 `json:"validation_code"`
+	ValidationCodeName  string                `json:"validation_code_name"`
+	Endorsements        []EndorsementDTO      `json:"endorsements"`
+	OriginMSPID         string                `json:"origin_msp_id,omitempty"`
+	PolicyID            string                `json:"policy_id"`
+	PolicyMet           bool                  `json:"policy_met"`
+	Timestamps          TimestampsDTO         `json:"timestamps"`
+	StatusEndpoint      string                `json:"status_endpoint,omitempty"`
+	Observation         ObservationDTO        `json:"observation,omitempty"`
+	InternalRef         string                `json:"internal_ref,omitempty"`
+	ReceiptHash         string                `json:"receipt_hash"`
+}
+
+type CommitmentOpeningDTO struct {
+	ChannelID   string `json:"channel_id"`
+	ChaincodeID string `json:"chaincode_id"`
+	Function    string `json:"function"`
+	FromID      string `json:"from_id"`
+	ToID        string `json:"to_id"`
+	AmountVND   int64  `json:"amount_vnd"`
+	InternalRef string `json:"internal_ref"`
+	Timestamp   int64  `json:"timestamp"`
+	Nonce       string `json:"nonce"`
+}
+
+type ObservationDTO struct {
+	ObservedAt int64  `json:"observed_at"`
+	AnchorType string `json:"anchor_type,omitempty"`
+	AnchorRef  string `json:"anchor_ref,omitempty"`
 }
 
 // EndorsementDTO represents endorsement in API response
@@ -72,23 +94,24 @@ type TimestampsDTO struct {
 
 // VerifyReceiptRequest represents receipt verification request
 type VerifyReceiptRequest struct {
-	Receipt              *ReceiptDTO `json:"receipt" binding:"required"`
-	ExpectedCommitmentHash string    `json:"expected_commitment_hash,omitempty"`
-	VerifyOnChain        bool        `json:"verify_on_chain"`
+	Receipt                *ReceiptDTO `json:"receipt" binding:"required"`
+	ExpectedCommitmentHash string      `json:"expected_commitment_hash,omitempty"`
+	VerifyOnChain          bool        `json:"verify_on_chain"`
 }
 
 // VerifyReceiptResponse represents receipt verification response
 type VerifyReceiptResponse struct {
-	Valid               bool                       `json:"valid"`
-	Errors              []string                   `json:"errors,omitempty"`
-	Warnings            []string                   `json:"warnings,omitempty"`
-	ReceiptHashValid    bool                       `json:"receipt_hash_valid"`
-	CommitmentHashMatch bool                       `json:"commitment_hash_match,omitempty"`
-	ValidationCodeValid bool                       `json:"validation_code_valid"`
-	PolicySatisfied     bool                       `json:"policy_satisfied"`
-	EndorsementResults  []EndorsementVerifyDTO     `json:"endorsement_results"`
-	BlockVerified       bool                       `json:"block_verified,omitempty"`
-	VerifiedAt          int64                      `json:"verified_at"`
+	Valid                  bool                   `json:"valid"`
+	Errors                 []string               `json:"errors,omitempty"`
+	Warnings               []string               `json:"warnings,omitempty"`
+	ReceiptHashValid       bool                   `json:"receipt_hash_valid"`
+	CommitmentHashMatch    bool                   `json:"commitment_hash_match,omitempty"`
+	CommitmentOpeningValid bool                   `json:"commitment_opening_valid,omitempty"`
+	ValidationCodeValid    bool                   `json:"validation_code_valid"`
+	PolicySatisfied        bool                   `json:"policy_satisfied"`
+	EndorsementResults     []EndorsementVerifyDTO `json:"endorsement_results"`
+	BlockVerified          bool                   `json:"block_verified,omitempty"`
+	VerifiedAt             int64                  `json:"verified_at"`
 }
 
 // EndorsementVerifyDTO represents endorsement verification result
@@ -111,10 +134,10 @@ type ErrorDetail struct {
 
 // HealthResponse represents health check response
 type HealthResponse struct {
-	Status        string    `json:"status"`
-	FabricStatus  string    `json:"fabric_status"`
-	Version       string    `json:"version"`
-	Timestamp     time.Time `json:"timestamp"`
+	Status       string    `json:"status"`
+	FabricStatus string    `json:"fabric_status"`
+	Version      string    `json:"version"`
+	Timestamp    time.Time `json:"timestamp"`
 }
 
 // Error codes

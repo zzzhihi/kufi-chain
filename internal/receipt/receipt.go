@@ -19,12 +19,16 @@ type Receipt struct {
 	SchemaVersion string `json:"schema_version"`
 
 	// Basic transaction identifiers
-	ChannelID    string `json:"channel_id"`
-	TxID         string `json:"tx_id"`
-	ChaincodeID  string `json:"chaincode_id"`
+	ChannelID   string `json:"channel_id"`
+	TxID        string `json:"tx_id"`
+	ChaincodeID string `json:"chaincode_id"`
 
 	// Commitment hash linking to actual transaction data
 	CommitmentHash string `json:"commitment_hash"`
+	// Commitment opening allows independent re-computation of commitment hash
+	CommitmentOpening *TransferCommitment `json:"commitment_opening,omitempty"`
+	// CommitmentAlgorithm documents deterministic encoding/hash rule
+	CommitmentAlgorithm string `json:"commitment_algorithm,omitempty"`
 
 	// Block information
 	BlockNumber uint64 `json:"block_number"`
@@ -37,6 +41,7 @@ type Receipt struct {
 
 	// Endorsement information
 	Endorsements []EndorsementRecord `json:"endorsements"`
+	OriginMSPID  string              `json:"origin_msp_id,omitempty"`
 	PolicyID     string              `json:"policy_id"`
 	PolicyMet    bool                `json:"policy_met"`
 
@@ -44,8 +49,9 @@ type Receipt struct {
 	Timestamps ReceiptTimestamps `json:"timestamps"`
 
 	// Verification aids
-	StatusEndpoint string `json:"status_endpoint,omitempty"`
-	
+	StatusEndpoint string          `json:"status_endpoint,omitempty"`
+	Observation    ObservationMeta `json:"observation,omitempty"`
+
 	// Internal reference from client
 	InternalRef string `json:"internal_ref,omitempty"`
 
@@ -54,25 +60,32 @@ type Receipt struct {
 	ReceiptHash      string `json:"receipt_hash"`
 }
 
+// ObservationMeta captures a minimal external observation anchor.
+type ObservationMeta struct {
+	ObservedAt int64  `json:"observed_at"`
+	AnchorType string `json:"anchor_type,omitempty"`
+	AnchorRef  string `json:"anchor_ref,omitempty"`
+}
+
 // EndorsementRecord represents an endorser's information in the receipt
 type EndorsementRecord struct {
-	MSPID            string `json:"msp_id"`
-	EndorserID       string `json:"endorser_id"`
-	CertFingerprint  string `json:"cert_fingerprint"`
-	CertificatePEM   string `json:"certificate_pem,omitempty"` // Optional full cert
-	SignatureHex     string `json:"signature_hex"`
-	Timestamp        int64  `json:"timestamp,omitempty"`
-	SignatureValid   bool   `json:"signature_valid"`
-	CertChainValid   bool   `json:"cert_chain_valid"`
+	MSPID           string `json:"msp_id"`
+	EndorserID      string `json:"endorser_id"`
+	CertFingerprint string `json:"cert_fingerprint"`
+	CertificatePEM  string `json:"certificate_pem,omitempty"` // Optional full cert
+	SignatureHex    string `json:"signature_hex"`
+	Timestamp       int64  `json:"timestamp,omitempty"`
+	SignatureValid  bool   `json:"signature_valid"`
+	CertChainValid  bool   `json:"cert_chain_valid"`
 }
 
 // ReceiptTimestamps contains various timestamps related to the transaction
 type ReceiptTimestamps struct {
-	ClientSubmit    int64 `json:"client_submit"`     // When client submitted request
-	EndorsementTime int64 `json:"endorsement_time"`  // When endorsements collected
+	ClientSubmit    int64 `json:"client_submit"`             // When client submitted request
+	EndorsementTime int64 `json:"endorsement_time"`          // When endorsements collected
 	OrdererReceive  int64 `json:"orderer_receive,omitempty"` // When orderer received
-	BlockCommit     int64 `json:"block_commit"`      // When block committed
-	ReceiptCreated  int64 `json:"receipt_created"`   // When receipt generated
+	BlockCommit     int64 `json:"block_commit"`              // When block committed
+	ReceiptCreated  int64 `json:"receipt_created"`           // When receipt generated
 }
 
 // TransferCommitment represents the data used to generate commitment hash
@@ -103,29 +116,37 @@ func ComputeCommitmentHash(commitment *TransferCommitment) string {
 func (r *Receipt) ComputeReceiptHash() string {
 	// Create a copy without signature for hashing
 	hashData := struct {
-		SchemaVersion  string              `json:"schema_version"`
-		ChannelID      string              `json:"channel_id"`
-		TxID           string              `json:"tx_id"`
-		CommitmentHash string              `json:"commitment_hash"`
-		BlockNumber    uint64              `json:"block_number"`
-		BlockHash      string              `json:"block_hash"`
-		ValidationCode int32               `json:"validation_code"`
-		Endorsements   []EndorsementRecord `json:"endorsements"`
-		PolicyID       string              `json:"policy_id"`
-		PolicyMet      bool                `json:"policy_met"`
-		Timestamps     ReceiptTimestamps   `json:"timestamps"`
+		SchemaVersion       string              `json:"schema_version"`
+		ChannelID           string              `json:"channel_id"`
+		TxID                string              `json:"tx_id"`
+		CommitmentHash      string              `json:"commitment_hash"`
+		CommitmentOpening   *TransferCommitment `json:"commitment_opening,omitempty"`
+		CommitmentAlgorithm string              `json:"commitment_algorithm,omitempty"`
+		BlockNumber         uint64              `json:"block_number"`
+		BlockHash           string              `json:"block_hash"`
+		ValidationCode      int32               `json:"validation_code"`
+		Endorsements        []EndorsementRecord `json:"endorsements"`
+		OriginMSPID         string              `json:"origin_msp_id,omitempty"`
+		PolicyID            string              `json:"policy_id"`
+		PolicyMet           bool                `json:"policy_met"`
+		Timestamps          ReceiptTimestamps   `json:"timestamps"`
+		Observation         ObservationMeta     `json:"observation,omitempty"`
 	}{
-		SchemaVersion:  r.SchemaVersion,
-		ChannelID:      r.ChannelID,
-		TxID:           r.TxID,
-		CommitmentHash: r.CommitmentHash,
-		BlockNumber:    r.BlockNumber,
-		BlockHash:      r.BlockHash,
-		ValidationCode: r.ValidationCode,
-		Endorsements:   r.Endorsements,
-		PolicyID:       r.PolicyID,
-		PolicyMet:      r.PolicyMet,
-		Timestamps:     r.Timestamps,
+		SchemaVersion:       r.SchemaVersion,
+		ChannelID:           r.ChannelID,
+		TxID:                r.TxID,
+		CommitmentHash:      r.CommitmentHash,
+		CommitmentOpening:   r.CommitmentOpening,
+		CommitmentAlgorithm: r.CommitmentAlgorithm,
+		BlockNumber:         r.BlockNumber,
+		BlockHash:           r.BlockHash,
+		ValidationCode:      r.ValidationCode,
+		Endorsements:        r.Endorsements,
+		OriginMSPID:         r.OriginMSPID,
+		PolicyID:            r.PolicyID,
+		PolicyMet:           r.PolicyMet,
+		Timestamps:          r.Timestamps,
+		Observation:         r.Observation,
 	}
 
 	data, _ := json.Marshal(hashData)
@@ -174,37 +195,39 @@ func ValidationCodeToName(code int32) string {
 
 // ReceiptBuilder builds verifiable receipts
 type ReceiptBuilder struct {
-	channelID      string
-	chaincodeID    string
-	statusEndpoint string
+	channelID        string
+	chaincodeID      string
+	statusEndpoint   string
 	includeFullCerts bool
 }
 
 // NewReceiptBuilder creates a new receipt builder
 func NewReceiptBuilder(channelID, chaincodeID, statusEndpoint string, includeFullCerts bool) *ReceiptBuilder {
 	return &ReceiptBuilder{
-		channelID:      channelID,
-		chaincodeID:    chaincodeID,
-		statusEndpoint: statusEndpoint,
+		channelID:        channelID,
+		chaincodeID:      chaincodeID,
+		statusEndpoint:   statusEndpoint,
 		includeFullCerts: includeFullCerts,
 	}
 }
 
 // BuildInput contains all data needed to build a receipt
 type BuildInput struct {
-	TxID           string
-	CommitmentHash string
-	BlockNumber    uint64
-	BlockHash      string
-	TxIndex        int
-	ValidationCode int32
-	Endorsements   []EndorsementInput
-	PolicyID       string
-	PolicyMet      bool
-	InternalRef    string
-	ClientSubmitTime time.Time
-	EndorsementTime  time.Time
-	CommitTime       time.Time
+	TxID              string
+	CommitmentHash    string
+	CommitmentOpening *TransferCommitment
+	BlockNumber       uint64
+	BlockHash         string
+	TxIndex           int
+	ValidationCode    int32
+	Endorsements      []EndorsementInput
+	OriginMSPID       string
+	PolicyID          string
+	PolicyMet         bool
+	InternalRef       string
+	ClientSubmitTime  time.Time
+	EndorsementTime   time.Time
+	CommitTime        time.Time
 }
 
 // EndorsementInput contains endorsement data for receipt building
@@ -221,26 +244,34 @@ type EndorsementInput struct {
 // Build creates a verifiable receipt from input data
 func (rb *ReceiptBuilder) Build(input *BuildInput) (*Receipt, error) {
 	receipt := &Receipt{
-		SchemaVersion:      SchemaVersion,
-		ChannelID:          rb.channelID,
-		TxID:               input.TxID,
-		ChaincodeID:        rb.chaincodeID,
-		CommitmentHash:     input.CommitmentHash,
-		BlockNumber:        input.BlockNumber,
-		BlockHash:          input.BlockHash,
-		TxIndex:            input.TxIndex,
-		ValidationCode:     input.ValidationCode,
-		ValidationCodeName: ValidationCodeToName(input.ValidationCode),
-		PolicyID:           input.PolicyID,
-		PolicyMet:          input.PolicyMet,
-		StatusEndpoint:     rb.statusEndpoint,
-		InternalRef:        input.InternalRef,
+		SchemaVersion:       SchemaVersion,
+		ChannelID:           rb.channelID,
+		TxID:                input.TxID,
+		ChaincodeID:         rb.chaincodeID,
+		CommitmentHash:      input.CommitmentHash,
+		CommitmentOpening:   input.CommitmentOpening,
+		CommitmentAlgorithm: "sha256(json-transfer-commitment-v1)",
+		BlockNumber:         input.BlockNumber,
+		BlockHash:           input.BlockHash,
+		TxIndex:             input.TxIndex,
+		ValidationCode:      input.ValidationCode,
+		ValidationCodeName:  ValidationCodeToName(input.ValidationCode),
+		OriginMSPID:         input.OriginMSPID,
+		PolicyID:            input.PolicyID,
+		PolicyMet:           input.PolicyMet,
+		StatusEndpoint:      rb.statusEndpoint,
+		InternalRef:         input.InternalRef,
 		Timestamps: ReceiptTimestamps{
 			ClientSubmit:    input.ClientSubmitTime.UnixMilli(),
 			EndorsementTime: input.EndorsementTime.UnixMilli(),
 			BlockCommit:     input.CommitTime.UnixMilli(),
 			ReceiptCreated:  time.Now().UnixMilli(),
 		},
+	}
+	receipt.Observation = ObservationMeta{
+		ObservedAt: receipt.Timestamps.ReceiptCreated,
+		AnchorType: "fabric_block_header_hash",
+		AnchorRef:  receipt.BlockHash,
 	}
 
 	// Build endorsement records

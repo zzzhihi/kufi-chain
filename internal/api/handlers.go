@@ -8,10 +8,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/hyperledger/fabric-gateway/pkg/identity"
 	"go.uber.org/zap"
 
 	"github.com/fabric-payment-gateway/internal/config"
@@ -29,6 +31,8 @@ type Handler struct {
 	receiptStore     ReceiptStorer
 	idempotencyStore IdempotencyStorer
 	nonceStore       NonceStorer
+	attestorSign     identity.Sign
+	attestorCertFP   string
 	logger           *zap.Logger
 }
 
@@ -54,6 +58,11 @@ func NewHandler(
 		return nil, fmt.Errorf("failed to create nonce store: %w", err)
 	}
 
+	attestorSign, attestorCertFP, err := loadAttestorSigner(cfg.Fabric.KeyPath, cfg.Fabric.CertPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load attestor signer: %w", err)
+	}
+
 	return &Handler{
 		config:       cfg,
 		fabricClient: fabricClient,
@@ -68,6 +77,8 @@ func NewHandler(
 		receiptStore:     receiptStore,
 		idempotencyStore: idempotencyStore,
 		nonceStore:       nonceStore,
+		attestorSign:     attestorSign,
+		attestorCertFP:   attestorCertFP,
 		logger:           logger,
 	}, nil
 }
@@ -79,10 +90,112 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 		v1.POST("/transfer", h.SubmitTransfer)
 		v1.GET("/receipt/:tx_id", h.GetReceipt)
 		v1.POST("/receipt/verify", h.VerifyReceipt)
+		v1.GET("/observe/:tx_id", h.ObserveTransaction)
 	}
 
 	// Health check
 	r.GET("/health", h.HealthCheck)
+}
+
+type observePayload struct {
+	MSPID          string `json:"msp_id"`
+	TxID           string `json:"tx_id"`
+	BlockNumber    uint64 `json:"block_number"`
+	BlockHash      string `json:"block_hash"`
+	ValidationCode int32  `json:"validation_code"`
+	ObservedAt     int64  `json:"observed_at"`
+}
+
+// ObserveTransaction returns node-level attestation that tx is committed on this node's ledger.
+func (h *Handler) ObserveTransaction(c *gin.Context) {
+	txID := strings.TrimSpace(c.Param("tx_id"))
+	if txID == "" {
+		h.respondError(c, http.StatusBadRequest, ErrCodeBadRequest, "Transaction ID required", "")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), h.config.Fabric.Timeouts.Evaluate)
+	defer cancel()
+
+	blockInfo, err := h.blockQuery.GetBlockByTxID(ctx, txID)
+	payload := observePayload{
+		MSPID:      h.config.Fabric.MSPID,
+		TxID:       txID,
+		ObservedAt: time.Now().UnixMilli(),
+	}
+	if err == nil {
+		txInfo, txErr := h.blockQuery.GetTransactionByID(ctx, txID)
+		if txErr == nil {
+			payload.BlockNumber = blockInfo.BlockNumber
+			payload.BlockHash = blockInfo.BlockHash
+			payload.ValidationCode = txInfo.ValidationCode
+		}
+	}
+	// Fallback path for orgs without QSCC ACL: prove state presence via chaincode query.
+	if payload.BlockHash == "" {
+		intentRaw, qErr := h.fabricClient.EvaluateTransaction(ctx, "QueryTransfer", txID)
+		if qErr != nil || len(intentRaw) == 0 {
+			details := ""
+			if err != nil {
+				details = err.Error()
+			}
+			if qErr != nil {
+				if details != "" {
+					details += " | "
+				}
+				details += qErr.Error()
+			}
+			h.respondError(c, http.StatusNotFound, ErrCodeNotFound, "Transaction not found on this node ledger", details)
+			return
+		}
+		payload.ValidationCode = 0
+	}
+	body, _ := json.Marshal(payload)
+	digest := sha256.Sum256(body)
+	sig, err := h.attestorSign(digest[:])
+	if err != nil {
+		h.respondError(c, http.StatusInternalServerError, ErrCodeInternalError, "Failed to sign observation", err.Error())
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"msp_id":           payload.MSPID,
+		"tx_id":            payload.TxID,
+		"block_number":     payload.BlockNumber,
+		"block_hash":       payload.BlockHash,
+		"validation_code":  payload.ValidationCode,
+		"observed_at":      payload.ObservedAt,
+		"proof_type":       map[bool]string{true: "block_commit", false: "state_presence"}[payload.BlockHash != ""],
+		"payload_hash":     hex.EncodeToString(digest[:]),
+		"signature_hex":    hex.EncodeToString(sig),
+		"cert_fingerprint": h.attestorCertFP,
+	})
+}
+
+func loadAttestorSigner(keyPath string, certPath string) (identity.Sign, string, error) {
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read key: %w", err)
+	}
+	priv, err := identity.PrivateKeyFromPEM(keyPEM)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse key: %w", err)
+	}
+	sign, err := identity.NewPrivateKeySign(priv)
+	if err != nil {
+		return nil, "", fmt.Errorf("create signer: %w", err)
+	}
+
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, "", fmt.Errorf("read cert: %w", err)
+	}
+	cert, err := identity.CertificateFromPEM(certPEM)
+	if err != nil {
+		return nil, "", fmt.Errorf("parse cert: %w", err)
+	}
+	fingerprint := sha256.Sum256(cert.Raw)
+	return sign, hex.EncodeToString(fingerprint[:]), nil
 }
 
 // SubmitTransfer handles POST /v1/transfer
@@ -171,17 +284,20 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 	}
 	privateDataJSON, _ := json.Marshal(privateData)
 
-	// Determine collection based on transfer type
-	// For intra-bank, use org-specific collection: collectionIntraBank_<OrgName>
+	// Determine collection based on transfer type.
+	// Transparency-first mode: route normal transfers to shared inter-bank collection
+	// so at least one independent org can co-endorse.
 	var collectionName string
 	if req.AmountVND >= h.config.Transaction.HighRiskThreshold {
-		collectionName = "collectionHighRisk"
-	} else if transferType == TransferTypeInterBank {
-		collectionName = h.config.Collections.InterBank
+		collectionName = h.config.Collections.Regulator
+		if collectionName == "" {
+			collectionName = "collectionHighRisk"
+		}
 	} else {
-		// Compute org-specific intra-bank collection from MSP ID
-		orgName := strings.TrimSuffix(h.config.Fabric.MSPID, "MSP")
-		collectionName = h.config.Collections.IntraBank + "_" + orgName
+		collectionName = h.config.Collections.InterBank
+		if collectionName == "" {
+			collectionName = "collectionInterBank"
+		}
 	}
 
 	// Prepare transient data for PDC
@@ -189,12 +305,8 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 		collectionName: privateDataJSON,
 	}
 
-	// Determine endorsing orgs — for per-org PDC we must include the owner org
-	var endorsingOrgs []string
-	if transferType == TransferTypeIntraBank {
-		// Single-org collection: endorse only on the owning org's peer
-		endorsingOrgs = []string{h.config.Fabric.MSPID}
-	}
+	// Require cross-org endorsements for transparency.
+	endorsingOrgs := h.selectTransparencyEndorsingOrgs()
 
 	// Submit to Fabric
 	clientSubmitTime := time.Now()
@@ -207,6 +319,23 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 		req.InternalRef,
 		policyID,
 	)
+	if err != nil && isMissingEndorsingPeerError(err) {
+		h.logger.Warn("Cross-org endorsement unavailable, retrying with origin org only",
+			zap.String("internalRef", req.InternalRef),
+			zap.String("originMSP", h.config.Fabric.MSPID),
+			zap.Error(err),
+		)
+		endorsingOrgs = []string{h.config.Fabric.MSPID}
+		result, err = h.fabricClient.SubmitTransactionWithPDC(
+			ctx,
+			"CreateTransferIntent",
+			transientData,
+			endorsingOrgs,
+			commitmentHash,
+			req.InternalRef,
+			policyID,
+		)
+	}
 	if err != nil && isMissingCollectionError(err) {
 		h.logger.Warn("Collection is missing on current chaincode definition, retrying submit without private data",
 			zap.String("internalRef", req.InternalRef),
@@ -259,17 +388,19 @@ func (h *Handler) SubmitTransfer(c *gin.Context) {
 
 	// Build receipt
 	buildInput := &receipt.BuildInput{
-		TxID:             result.TxID,
-		CommitmentHash:   commitmentHash,
-		BlockNumber:      result.BlockNumber,
-		BlockHash:        blockHash,
-		ValidationCode:   result.ValidationCode,
-		PolicyID:         policyID,
-		PolicyMet:        result.ValidationCode == 0,
-		InternalRef:      req.InternalRef,
-		ClientSubmitTime: clientSubmitTime,
-		EndorsementTime:  result.CommitTimestamp,
-		CommitTime:       result.CommitTimestamp,
+		TxID:              result.TxID,
+		CommitmentHash:    commitmentHash,
+		CommitmentOpening: commitment,
+		BlockNumber:       result.BlockNumber,
+		BlockHash:         blockHash,
+		ValidationCode:    result.ValidationCode,
+		OriginMSPID:       h.config.Fabric.MSPID,
+		PolicyID:          policyID,
+		PolicyMet:         h.isTransparencyPolicyMet(result.Endorsements),
+		InternalRef:       req.InternalRef,
+		ClientSubmitTime:  clientSubmitTime,
+		EndorsementTime:   result.CommitTimestamp,
+		CommitTime:        result.CommitTimestamp,
 	}
 
 	if txInfo != nil {
@@ -317,6 +448,14 @@ func isMissingCollectionError(err error) bool {
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "collection") && strings.Contains(msg, "could not be found")
+}
+
+func isMissingEndorsingPeerError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "failed to find any endorsing peers")
 }
 
 // GetReceipt handles GET /v1/receipt/:tx_id
@@ -369,15 +508,16 @@ func (h *Handler) VerifyReceipt(c *gin.Context) {
 
 	// Convert to response
 	response := VerifyReceiptResponse{
-		Valid:               result.Valid,
-		Errors:              result.Errors,
-		Warnings:            result.Warnings,
-		ReceiptHashValid:    result.ReceiptHashValid,
-		CommitmentHashMatch: result.CommitmentHashMatch,
-		ValidationCodeValid: result.ValidationCodeValid,
-		PolicySatisfied:     result.PolicySatisfied,
-		BlockVerified:       result.BlockVerified,
-		VerifiedAt:          result.VerifiedAt,
+		Valid:                  result.Valid,
+		Errors:                 result.Errors,
+		Warnings:               result.Warnings,
+		ReceiptHashValid:       result.ReceiptHashValid,
+		CommitmentHashMatch:    result.CommitmentHashMatch,
+		CommitmentOpeningValid: result.CommitmentOpeningValid,
+		ValidationCodeValid:    result.ValidationCodeValid,
+		PolicySatisfied:        result.PolicySatisfied,
+		BlockVerified:          result.BlockVerified,
+		VerifiedAt:             result.VerifiedAt,
 	}
 
 	for _, er := range result.EndorsementResults {
@@ -435,30 +575,82 @@ func (h *Handler) determinePolicyID(req *TransferRequest) string {
 	if req.AmountVND >= h.config.Transaction.HighRiskThreshold {
 		return "high_risk"
 	}
-	if req.TransferType == TransferTypeInterBank {
-		return "inter_bank_standard"
+	// Keep a single shared policy for normal transfers to support cross-org endorsements.
+	return "inter_bank_standard"
+}
+
+func (h *Handler) selectTransparencyEndorsingOrgs() []string {
+	// Local canonical network has 3 orgs. We require quorum >= 2 endorsements
+	// including the origin org and at least one independent org.
+	candidates := []string{
+		h.config.Fabric.MSPID,
+		"TechcombankMSP",
+		"VietcombankMSP",
+		"TaxMSP",
 	}
-	return "intra_bank_standard"
+	seen := map[string]struct{}{}
+	orgs := make([]string, 0, 3)
+	for _, org := range candidates {
+		if org == "" {
+			continue
+		}
+		if _, ok := seen[org]; ok {
+			continue
+		}
+		seen[org] = struct{}{}
+		orgs = append(orgs, org)
+	}
+	if len(orgs) == 1 {
+		return orgs
+	}
+	// request 2 endorsements by default (N/2 quorum in a 3-org network)
+	return orgs[:2]
+}
+
+func (h *Handler) isTransparencyPolicyMet(endorsements []*fabric.Endorsement) bool {
+	if len(endorsements) == 0 {
+		return false
+	}
+	origin := h.config.Fabric.MSPID
+	distinct := map[string]struct{}{}
+	hasIndependent := false
+	for _, e := range endorsements {
+		if e == nil || e.MSPID == "" {
+			continue
+		}
+		distinct[e.MSPID] = struct{}{}
+		if e.MSPID != origin {
+			hasIndependent = true
+		}
+	}
+	return len(distinct) >= 2 && hasIndependent
 }
 
 // receiptToDTO converts internal Receipt to API DTO
 func (h *Handler) receiptToDTO(r *receipt.Receipt) *ReceiptDTO {
 	dto := &ReceiptDTO{
-		SchemaVersion:      r.SchemaVersion,
-		ChannelID:          r.ChannelID,
-		TxID:               r.TxID,
-		ChaincodeID:        r.ChaincodeID,
-		CommitmentHash:     r.CommitmentHash,
-		BlockNumber:        r.BlockNumber,
-		BlockHash:          r.BlockHash,
-		TxIndex:            r.TxIndex,
-		ValidationCode:     r.ValidationCode,
-		ValidationCodeName: r.ValidationCodeName,
-		PolicyID:           r.PolicyID,
-		PolicyMet:          r.PolicyMet,
-		StatusEndpoint:     r.StatusEndpoint,
-		InternalRef:        r.InternalRef,
-		ReceiptHash:        r.ReceiptHash,
+		SchemaVersion:       r.SchemaVersion,
+		ChannelID:           r.ChannelID,
+		TxID:                r.TxID,
+		ChaincodeID:         r.ChaincodeID,
+		CommitmentHash:      r.CommitmentHash,
+		CommitmentAlgorithm: r.CommitmentAlgorithm,
+		BlockNumber:         r.BlockNumber,
+		BlockHash:           r.BlockHash,
+		TxIndex:             r.TxIndex,
+		ValidationCode:      r.ValidationCode,
+		ValidationCodeName:  r.ValidationCodeName,
+		PolicyID:            r.PolicyID,
+		OriginMSPID:         r.OriginMSPID,
+		PolicyMet:           r.PolicyMet,
+		StatusEndpoint:      r.StatusEndpoint,
+		Observation: ObservationDTO{
+			ObservedAt: r.Observation.ObservedAt,
+			AnchorType: r.Observation.AnchorType,
+			AnchorRef:  r.Observation.AnchorRef,
+		},
+		InternalRef: r.InternalRef,
+		ReceiptHash: r.ReceiptHash,
 		Timestamps: TimestampsDTO{
 			ClientSubmit:    r.Timestamps.ClientSubmit,
 			EndorsementTime: r.Timestamps.EndorsementTime,
@@ -466,6 +658,19 @@ func (h *Handler) receiptToDTO(r *receipt.Receipt) *ReceiptDTO {
 			BlockCommit:     r.Timestamps.BlockCommit,
 			ReceiptCreated:  r.Timestamps.ReceiptCreated,
 		},
+	}
+	if r.CommitmentOpening != nil {
+		dto.CommitmentOpening = &CommitmentOpeningDTO{
+			ChannelID:   r.CommitmentOpening.ChannelID,
+			ChaincodeID: r.CommitmentOpening.ChaincodeID,
+			Function:    r.CommitmentOpening.Function,
+			FromID:      r.CommitmentOpening.FromID,
+			ToID:        r.CommitmentOpening.ToID,
+			AmountVND:   r.CommitmentOpening.AmountVND,
+			InternalRef: r.CommitmentOpening.InternalRef,
+			Timestamp:   r.CommitmentOpening.Timestamp,
+			Nonce:       r.CommitmentOpening.Nonce,
+		}
 	}
 
 	for _, e := range r.Endorsements {
@@ -530,18 +735,20 @@ func (h *Handler) rebuildReceiptFromLedger(
 	}
 
 	buildInput := &receipt.BuildInput{
-		TxID:             existing.TxID,
-		CommitmentHash:   existing.CommitmentHash,
-		BlockNumber:      existing.BlockNumber,
-		BlockHash:        existing.BlockHash,
-		TxIndex:          existing.TxIndex,
-		ValidationCode:   existing.ValidationCode,
-		PolicyID:         existing.PolicyID,
-		PolicyMet:        existing.PolicyMet,
-		InternalRef:      existing.InternalRef,
-		ClientSubmitTime: timeFromUnixMilli(existing.Timestamps.ClientSubmit),
-		EndorsementTime:  timeFromUnixMilli(existing.Timestamps.EndorsementTime),
-		CommitTime:       timeFromUnixMilli(existing.Timestamps.BlockCommit),
+		TxID:              existing.TxID,
+		CommitmentHash:    existing.CommitmentHash,
+		CommitmentOpening: existing.CommitmentOpening,
+		BlockNumber:       existing.BlockNumber,
+		BlockHash:         existing.BlockHash,
+		TxIndex:           existing.TxIndex,
+		ValidationCode:    existing.ValidationCode,
+		OriginMSPID:       existing.OriginMSPID,
+		PolicyID:          existing.PolicyID,
+		PolicyMet:         existing.PolicyMet,
+		InternalRef:       existing.InternalRef,
+		ClientSubmitTime:  timeFromUnixMilli(existing.Timestamps.ClientSubmit),
+		EndorsementTime:   timeFromUnixMilli(existing.Timestamps.EndorsementTime),
+		CommitTime:        timeFromUnixMilli(existing.Timestamps.BlockCommit),
 	}
 	if txInfo.TxIndex > 0 {
 		buildInput.TxIndex = txInfo.TxIndex
@@ -553,6 +760,12 @@ func (h *Handler) rebuildReceiptFromLedger(
 		return nil, err
 	}
 	rebuilt.ReceiptSignature = existing.ReceiptSignature
+	if existing.CommitmentAlgorithm != "" {
+		rebuilt.CommitmentAlgorithm = existing.CommitmentAlgorithm
+	}
+	if existing.Observation.ObservedAt > 0 || existing.Observation.AnchorRef != "" || existing.Observation.AnchorType != "" {
+		rebuilt.Observation = existing.Observation
+	}
 	rebuilt.Timestamps.OrdererReceive = existing.Timestamps.OrdererReceive
 
 	return rebuilt, nil
@@ -568,21 +781,28 @@ func timeFromUnixMilli(ms int64) time.Time {
 // dtoToReceipt converts API DTO to internal Receipt
 func (h *Handler) dtoToReceipt(dto *ReceiptDTO) *receipt.Receipt {
 	r := &receipt.Receipt{
-		SchemaVersion:      dto.SchemaVersion,
-		ChannelID:          dto.ChannelID,
-		TxID:               dto.TxID,
-		ChaincodeID:        dto.ChaincodeID,
-		CommitmentHash:     dto.CommitmentHash,
-		BlockNumber:        dto.BlockNumber,
-		BlockHash:          dto.BlockHash,
-		TxIndex:            dto.TxIndex,
-		ValidationCode:     dto.ValidationCode,
-		ValidationCodeName: dto.ValidationCodeName,
-		PolicyID:           dto.PolicyID,
-		PolicyMet:          dto.PolicyMet,
-		StatusEndpoint:     dto.StatusEndpoint,
-		InternalRef:        dto.InternalRef,
-		ReceiptHash:        dto.ReceiptHash,
+		SchemaVersion:       dto.SchemaVersion,
+		ChannelID:           dto.ChannelID,
+		TxID:                dto.TxID,
+		ChaincodeID:         dto.ChaincodeID,
+		CommitmentHash:      dto.CommitmentHash,
+		CommitmentAlgorithm: dto.CommitmentAlgorithm,
+		BlockNumber:         dto.BlockNumber,
+		BlockHash:           dto.BlockHash,
+		TxIndex:             dto.TxIndex,
+		ValidationCode:      dto.ValidationCode,
+		ValidationCodeName:  dto.ValidationCodeName,
+		PolicyID:            dto.PolicyID,
+		OriginMSPID:         dto.OriginMSPID,
+		PolicyMet:           dto.PolicyMet,
+		StatusEndpoint:      dto.StatusEndpoint,
+		Observation: receipt.ObservationMeta{
+			ObservedAt: dto.Observation.ObservedAt,
+			AnchorType: dto.Observation.AnchorType,
+			AnchorRef:  dto.Observation.AnchorRef,
+		},
+		InternalRef: dto.InternalRef,
+		ReceiptHash: dto.ReceiptHash,
 		Timestamps: receipt.ReceiptTimestamps{
 			ClientSubmit:    dto.Timestamps.ClientSubmit,
 			EndorsementTime: dto.Timestamps.EndorsementTime,
@@ -590,6 +810,19 @@ func (h *Handler) dtoToReceipt(dto *ReceiptDTO) *receipt.Receipt {
 			BlockCommit:     dto.Timestamps.BlockCommit,
 			ReceiptCreated:  dto.Timestamps.ReceiptCreated,
 		},
+	}
+	if dto.CommitmentOpening != nil {
+		r.CommitmentOpening = &receipt.TransferCommitment{
+			ChannelID:   dto.CommitmentOpening.ChannelID,
+			ChaincodeID: dto.CommitmentOpening.ChaincodeID,
+			Function:    dto.CommitmentOpening.Function,
+			FromID:      dto.CommitmentOpening.FromID,
+			ToID:        dto.CommitmentOpening.ToID,
+			AmountVND:   dto.CommitmentOpening.AmountVND,
+			InternalRef: dto.CommitmentOpening.InternalRef,
+			Timestamp:   dto.CommitmentOpening.Timestamp,
+			Nonce:       dto.CommitmentOpening.Nonce,
+		}
 	}
 
 	for _, e := range dto.Endorsements {
