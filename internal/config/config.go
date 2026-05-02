@@ -201,7 +201,7 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("transaction.idempotency_ttl", "24h")
 	v.SetDefault("transaction.nonce_window", "5m")
 	v.SetDefault("transaction.high_risk_threshold", 1000000000)
-	v.SetDefault("transaction.rate_limit", 100)
+	v.SetDefault("transaction.rate_limit", 20000)
 	v.SetDefault("transaction.rate_limit_window", "1m")
 	v.SetDefault("transaction.retry.max_attempts", 3)
 	v.SetDefault("transaction.retry.initial_backoff", "100ms")
