@@ -1446,7 +1446,7 @@ transaction:
   idempotency_ttl: 24h
   nonce_window: 5m
   high_risk_threshold: 1000000000
-  rate_limit: 100
+  rate_limit: 20000
   rate_limit_window: 1m
 
 worker_pool:
